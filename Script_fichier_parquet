@@ -1,0 +1,242 @@
+
+import argparse
+import logging
+import os
+import sys
+from pathlib import Path
+import duckdb
+
+LOG = logging.getLogger("merge_patents")
+
+DEFAULT_BASE = "/Users/quentinbenchetrit/Documents/2A/Projet stat"
+DEFAULT_CSV = str(Path(DEFAULT_BASE) / "list_cpc_patent_EP.csv")
+DEFAULT_TXT = str(Path(DEFAULT_BASE) / "202401_EPO_App_reg.txt")
+DEFAULT_OUT = str(Path(DEFAULT_BASE) / "patents_merged.parquet")
+DEFAULT_DB  = str(Path(DEFAULT_BASE) / "work.duckdb")
+
+def parse_args():
+    p = argparse.ArgumentParser(
+        description="Merge EP patent CSV (CPC4) and pipe-delimited TXT (applicants) into a single Parquet with one row per patent present in both sources."
+    )
+    p.add_argument("--csv", default=DEFAULT_CSV, help="Path to CSV (list_cpc_patent_EP).")
+    p.add_argument("--txt", default=DEFAULT_TXT, help='Path to pipe-delimited TXT (App_reg, "|" as delimiter).')
+    p.add_argument("--out", default=DEFAULT_OUT, help="Output Parquet path.")
+    p.add_argument("--duckdb", default=DEFAULT_DB, help="DuckDB database file to use (for caching/spill).")
+    p.add_argument("--threads", type=int, default=os.cpu_count() or 4, help="DuckDB threads (default: CPU count).")
+    p.add_argument("--pad", type=int, default=7, help="Zero-pad length for ep_doc (EP-{doc:0{pad}d}).")
+    return p.parse_args()
+
+def fail(msg: str):
+    LOG.error(msg)
+    sys.exit(1)
+
+def main():
+    args = parse_args()
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    )
+
+    csv_path = Path(args.csv)
+    txt_path = Path(args.txt)
+    out_path = Path(args.out)
+
+    if not csv_path.is_file():
+        fail(f"CSV not found: {csv_path}")
+    if not txt_path.is_file():
+        fail(f"TXT not found: {txt_path}")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    con = duckdb.connect(database=str(args.duckdb) if args.duckdb else ":memory:")
+    con.execute(f"PRAGMA threads={args.threads}")
+    con.execute("PRAGMA preserve_insertion_order=false")
+
+    LOG.info("Reading CSV and TXT using read_csv_auto (streaming from disk).")
+
+    # Raw views
+    con.execute(
+        f"""
+        CREATE OR REPLACE VIEW csv_raw AS
+        SELECT * FROM read_csv_auto(
+            '{csv_path.as_posix()}',
+            SAMPLE_SIZE=-1,
+            HEADER=TRUE,
+            NULLSTRINGS=['','NULL','NaN']
+        );
+        """
+    )
+    con.execute(
+        f"""
+        CREATE OR REPLACE VIEW txt_raw AS
+        SELECT * FROM read_csv_auto(
+            '{txt_path.as_posix()}',
+            DELIM='|',
+            QUOTE='\"',
+            SAMPLE_SIZE=-1,
+            HEADER=TRUE,
+            NULLSTRINGS=['','NULL','NaN']
+        );
+        """
+    )
+
+    # Validate headers
+    def cols_of(view):
+        cur = con.execute(f"SELECT * FROM {view} LIMIT 0")
+        return [c[0] for c in cur.description]
+
+    csv_cols = set(cols_of("csv_raw"))
+    txt_cols = set(cols_of("txt_raw"))
+
+    needed_csv = {"publication_number", "publication_date", "CPC4"}
+    needed_txt = {
+        "app_nbr","appln_id","pub_nbr","person_id","app_name","address","city",
+        "postal_code","reg_code","ctry_code","reg_share","app_share",
+    }
+
+    if not needed_csv.issubset(csv_cols):
+        fail(f"CSV missing required columns. Found={sorted(csv_cols)} Needed>={sorted(needed_csv)}")
+    if not needed_txt.issubset(txt_cols):
+        fail(f"TXT missing required columns. Found={sorted(txt_cols)} Needed>={sorted(needed_txt)}")
+
+    # Counts
+    csv_rows = con.execute("SELECT COUNT(*) FROM csv_raw").fetchone()[0]
+    txt_rows = con.execute("SELECT COUNT(*) FROM txt_raw").fetchone()[0]
+    LOG.info(f"CSV rows: {csv_rows:,}")
+    LOG.info(f"TXT rows: {txt_rows:,}")
+
+    # --- Normalize & clean ---
+
+    # CSV: extract doc_number, earliest publication_date, unique CPC4 list
+    con.execute(
+        """
+        CREATE OR REPLACE VIEW csv_clean AS
+        WITH base AS (
+            SELECT
+                COALESCE(
+                    regexp_extract(publication_number, '^EP-0*([0-9]+)-[A-Z][0-9]$', 1),
+                    regexp_extract(publication_number, '^EP0*([0-9]+)[A-Z][0-9]$', 1),
+                    regexp_extract(publication_number, '^EP-?0*([0-9]+)$', 1)
+                ) AS doc_number_str,
+                try_cast(publication_date AS DATE) AS publication_date,
+                upper(trim(CPC4)) AS cpc4
+            FROM csv_raw
+        ),
+        filtered AS (
+            SELECT
+                try_cast(doc_number_str AS BIGINT) AS doc_number,
+                publication_date,
+                cpc4
+            FROM base
+            WHERE doc_number_str IS NOT NULL
+        ),
+        pub_agg AS (
+            SELECT doc_number, min(publication_date) AS publication_date
+            FROM filtered
+            GROUP BY doc_number
+        ),
+        cpc_distinct AS (
+            SELECT DISTINCT doc_number, cpc4
+            FROM filtered
+            WHERE cpc4 IS NOT NULL AND cpc4 <> ''
+        )
+        SELECT
+            p.doc_number,
+            p.publication_date,
+            list(cd.cpc4) AS cpc4_list
+        FROM pub_agg p
+        JOIN cpc_distinct cd USING (doc_number)
+        GROUP BY p.doc_number, p.publication_date
+        ;
+        """
+    )
+
+    csv_valid_docs = con.execute("SELECT COUNT(*) FROM csv_clean").fetchone()[0]
+    LOG.info(f"CSV patents with valid doc_number: {csv_valid_docs:,}")
+
+    # TXT: pub_nbr → doc_number; aggregate applicants
+    con.execute(
+        """
+        CREATE OR REPLACE VIEW txt_clean AS
+        SELECT
+            try_cast(nullif(trim(pub_nbr), '') AS BIGINT) AS doc_number,
+            person_id, app_name, address, city, postal_code, reg_code,
+            ctry_code, reg_share, app_share
+        FROM txt_raw
+        WHERE pub_nbr IS NOT NULL AND trim(pub_nbr) <> ''
+        ;
+        """
+    )
+
+    txt_valid_docs = con.execute(
+        "SELECT COUNT(DISTINCT doc_number) FROM txt_clean WHERE doc_number IS NOT NULL"
+    ).fetchone()[0]
+    LOG.info(f"TXT patents with valid doc_number: {txt_valid_docs:,}")
+
+    con.execute(
+        """
+        CREATE OR REPLACE VIEW applicants_agg AS
+        SELECT
+            doc_number,
+            list(person_id)   AS person_id_list,
+            list(app_name)    AS app_name_list,
+            list(address)     AS address_list,
+            list(city)        AS city_list,
+            list(postal_code) AS postal_code_list,
+            list(reg_code)    AS reg_code_list,
+            list(ctry_code)   AS ctry_code_list,
+            list(reg_share)   AS reg_share_list,
+            list(app_share)   AS app_share_list,
+            count(*)          AS num_applicants
+        FROM txt_clean
+        WHERE doc_number IS NOT NULL
+        GROUP BY doc_number
+        ;
+        """
+    )
+
+    pad = int(args.pad)
+    # FINAL: inner join + explicit filter to drop empty CPC lists
+    con.execute(
+        f"""
+        CREATE OR REPLACE VIEW final AS
+        SELECT
+            c.doc_number,
+            'EP-' || lpad(cast(c.doc_number AS VARCHAR), {pad}, '0') AS ep_doc,
+            c.publication_date,
+            c.cpc4_list,
+            a.person_id_list,
+            a.app_name_list,
+            a.address_list,
+            a.city_list,
+            a.postal_code_list,
+            a.reg_code_list,
+            a.ctry_code_list,
+            a.reg_share_list,
+            a.app_share_list,
+            a.num_applicants
+        FROM csv_clean c
+        INNER JOIN applicants_agg a USING (doc_number)
+        WHERE list_length(c.cpc4_list) > 0
+        ;
+        """
+    )
+
+    matched = con.execute(
+        "SELECT COUNT(*) FROM (SELECT doc_number FROM csv_clean) i INNER JOIN (SELECT doc_number FROM applicants_agg) a USING (doc_number)"
+    ).fetchone()[0]
+    final_count = con.execute("SELECT COUNT(*) FROM final").fetchone()[0]
+    LOG.info(f"Matched patents (intersection): {matched:,}")
+    LOG.info(f"Final row count (one row per patent; CPC list non-empty): {final_count:,}")
+
+    LOG.info(f"Writing Parquet → {out_path}")
+    con.execute(f"COPY final TO '{out_path.as_posix()}' (FORMAT PARQUET);")
+    LOG.info("Done.")
+
+if __name__ == "__main__":
+    try:
+        main()
+    except duckdb.Error as e:
+        fail(f"DuckDB error: {e}")
+    except Exception as e:
+        fail(f"Unexpected error: {e}")
