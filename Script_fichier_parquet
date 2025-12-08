@@ -10,7 +10,7 @@ import duckdb
 
 LOG = logging.getLogger("merge_patents_ep7")
 
-DEFAULT_BASE = "/home/onyxia/work/Projet stat"
+DEFAULT_BASE = "/home/onyxia/work/"
 DEFAULT_CSV = str(Path(DEFAULT_BASE) / "list_cpc_patent_EP.csv")
 DEFAULT_TXT = str(Path(DEFAULT_BASE) / "202401_EPO_App_reg.txt")
 DEFAULT_OUT = str(Path(DEFAULT_BASE) / "patents_merged.parquet")
@@ -18,7 +18,10 @@ DEFAULT_DB  = str(Path(DEFAULT_BASE) / "work.duckdb")
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Merge EP CSV (CPC4) and TXT (applicants) using a strict 7-digit EP key."
+        description=(
+            "Merge EP CSV (CPC4) and TXT (applicants) using the EP document number: "
+            "extracted from publication_number in CSV and taken from pub_nbr in TXT."
+        )
     )
     p.add_argument("--csv", default=DEFAULT_CSV, help="Path to CSV (list_cpc_patent_EP.csv)")
     p.add_argument("--txt", default=DEFAULT_TXT, help="Path to TXT (202401_EPO_App_reg.txt, '|' delimited)")
@@ -74,9 +77,11 @@ def main():
     csv_cols = {c[0] for c in con.execute("SELECT * FROM csv_raw LIMIT 0").description}
     txt_cols = {c[0] for c in con.execute("SELECT * FROM txt_raw LIMIT 0").description}
 
+    # Côté CSV : on utilise publication_number, publication_date, CPC4
     need_csv = {"publication_number", "publication_date", "CPC4"}
+    # Côté TXT : la clé est basée sur pub_nbr (et on garde les autres métadonnées)
     need_txt = {
-        "app_nbr", "appln_id", "pub_nbr", "person_id", "app_name", "address", "city",
+        "pub_nbr", "appln_id", "person_id", "app_name", "address", "city",
         "postal_code", "reg_code", "ctry_code", "reg_share", "app_share"
     }
 
@@ -90,70 +95,72 @@ def main():
     txt_rows = con.execute("SELECT COUNT(*) FROM txt_raw").fetchone()[0]
     LOG.info(f"CSV rows: {csv_rows:,} | TXT rows: {txt_rows:,}")
 
-    # 4) Côté CSV : extraire STRICTEMENT 7 chiffres entre 'EP-' et '-<Lettre><Chiffre>'
+    # 4) Côté CSV : extraire un numéro de document entier (doc_number) depuis publication_number
+    #    Exemple : EP-0021337-B1 -> 21337 ; EP-1070969-A1 -> 1070969
     con.execute("""
         CREATE OR REPLACE VIEW csv_keyed AS
         SELECT
-            -- doc7 : exactement 7 chiffres capturés
-            regexp_extract(publication_number, '^EP-0*([0-9]{7})-[A-Z][0-9]$', 1) AS doc7,
-            -- IMPORTANT: garder la date telle quelle (string) pour éviter les NULL
+            try_cast(
+                regexp_extract(
+                    publication_number,
+                    '^EP-0*([0-9]{7})-[A-Z][0-9]$',
+                    1
+                ) AS BIGINT
+            ) AS doc_number,
             publication_date AS publication_date,
             upper(trim(CPC4)) AS cpc4
         FROM csv_raw;
     """)
 
-    # 5) Nettoyage & agrégation des CPC (uniques) par doc7
+    # 5) Nettoyage & agrégation des CPC (uniques) par doc_number
     con.execute("""
         CREATE OR REPLACE VIEW csv_cpc AS
         WITH filtered AS (
-            SELECT doc7, publication_date, cpc4
+            SELECT doc_number, publication_date, cpc4
             FROM csv_keyed
-            WHERE doc7 IS NOT NULL
+            WHERE doc_number IS NOT NULL
               AND cpc4 IS NOT NULL AND cpc4 <> ''
         ),
         pub_agg AS (
-            -- MIN() sur string suffit si format ISO (YYYY-MM-DD)
-            SELECT doc7, min(publication_date) AS publication_date
+            -- Date de publication : on garde la plus ancienne
+            SELECT doc_number, min(publication_date) AS publication_date
             FROM filtered
-            GROUP BY doc7
+            GROUP BY doc_number
         ),
         cpc_distinct AS (
-            SELECT DISTINCT doc7, cpc4
+            SELECT DISTINCT doc_number, cpc4
             FROM filtered
         )
         SELECT
-            p.doc7,
+            p.doc_number,
             p.publication_date,
             list(cd.cpc4) AS cpc4_list
         FROM pub_agg p
-        JOIN cpc_distinct cd USING (doc7)
-        GROUP BY p.doc7, p.publication_date;
+        JOIN cpc_distinct cd USING (doc_number)
+        GROUP BY p.doc_number, p.publication_date;
     """)
 
     csv_valid = con.execute("SELECT COUNT(*) FROM csv_cpc").fetchone()[0]
-    LOG.info(f"CSV patents with 7-digit key & CPC: {csv_valid:,}")
+    LOG.info(f"CSV patents with doc_number & CPC: {csv_valid:,}")
 
-    # 6) Côté TXT : construire doc7 depuis app_nbr
+    # 6) Côté TXT : construire doc_number depuis pub_nbr (7 chiffres)
+    #    Exemple : pub_nbr = 1070969 -> doc_number = 1070969
     con.execute("""
         CREATE OR REPLACE VIEW txt_keyed AS
         SELECT
-            -- doc7 extrait depuis app_nbr nettoyé
-            regexp_extract(
-                upper(replace(trim(app_nbr), '\"', '')),
-                '^EP[0-9]{4}([0-9]{7}).*$',
-                1
-            ) AS doc7,
+            try_cast(trim(pub_nbr) AS BIGINT) AS doc_number,
             person_id, app_name, address, city, postal_code, reg_code,
             ctry_code, reg_share, app_share
         FROM txt_raw
-        WHERE app_nbr IS NOT NULL AND trim(app_nbr) <> '';
+        WHERE pub_nbr IS NOT NULL
+          AND trim(pub_nbr) <> '';
     """)
 
-    # 7) Agréger les applicants par doc7
+    # 7) Agréger les applicants par doc_number
     con.execute("""
         CREATE OR REPLACE VIEW applicants AS
         SELECT
-            doc7,
+            doc_number,
             list(person_id)   AS person_id_list,
             list(app_name)    AS app_name_list,
             list(address)     AS address_list,
@@ -165,21 +172,21 @@ def main():
             list(app_share)   AS app_share_list,
             count(*)          AS num_applicants
         FROM txt_keyed
-        WHERE doc7 IS NOT NULL
-        GROUP BY doc7;
+        WHERE doc_number IS NOT NULL
+        GROUP BY doc_number;
     """)
 
     txt_valid = con.execute("SELECT COUNT(*) FROM applicants").fetchone()[0]
-    LOG.info(f"TXT applicants with 7-digit key (from app_nbr): {txt_valid:,}")
+    LOG.info(f"TXT applicants with doc_number (from pub_nbr): {txt_valid:,}")
 
-    # 8) Jointure sur doc7
+    # 8) Jointure sur doc_number
     con.execute("""
         CREATE OR REPLACE VIEW final AS
         SELECT
-            c.doc7,
-            try_cast(c.doc7 AS BIGINT) AS doc_number,  -- clé numérique 7 chiffres optionnelle
-            'EP-' || c.doc7 AS ep_doc,                 -- EP-xxxxxxx sans kind
-            c.publication_date,                        -- maintenant non nulle si CSV est rempli
+            c.doc_number,
+            lpad(cast(c.doc_number AS VARCHAR), 7, '0') AS doc7,
+            'EP-' || lpad(cast(c.doc_number AS VARCHAR), 7, '0') AS ep_doc,
+            c.publication_date,
             c.cpc4_list,
             a.person_id_list,
             a.app_name_list,
@@ -192,19 +199,19 @@ def main():
             a.app_share_list,
             a.num_applicants
         FROM csv_cpc c
-        INNER JOIN applicants a USING (doc7)
+        INNER JOIN applicants a USING (doc_number)
         WHERE c.cpc4_list IS NOT NULL;
     """)
 
     matched = con.execute("""
         SELECT COUNT(*) FROM (
-            SELECT doc7 FROM csv_cpc
+            SELECT doc_number FROM csv_cpc
             INTERSECT
-            SELECT doc7 FROM applicants
+            SELECT doc_number FROM applicants
         );
     """).fetchone()[0]
     final_count = con.execute("SELECT COUNT(*) FROM final").fetchone()[0]
-    LOG.info(f"Matched on 7-digit key (intersection): {matched:,}")
+    LOG.info(f"Matched on doc_number (intersection): {matched:,}")
     LOG.info(f"Final row count (CPC non-empty): {final_count:,}")
 
     # 9) Écriture Parquet
@@ -219,3 +226,4 @@ if __name__ == "__main__":
         fail(f"DuckDB error: {e}")
     except Exception as e:
         fail(f"Unexpected error: {e}")
+
