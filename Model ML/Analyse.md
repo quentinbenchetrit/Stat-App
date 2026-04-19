@@ -26,7 +26,7 @@ C12N / C12R — Bio / Indexation
 Standardisation biologique. Utilisation du génie génétique pour cataloguer et indexer systématiquement les micro-organismes pour la recherche.
 
 G06F / G06N — Info / IA
-硬件 d'accélération. Passage de l'informatique classique à des architectures optimisées pour le calcul neuronal (puces NPU). Un signal constant bien que sélectif.
+  Passage de l'informatique classique à des architectures optimisées pour le calcul neuronal (puces NPU). Un signal constant bien que sélectif.
 
 #### Tendances structurelles et analyse du modèle
 Au-delà des paires individuelles, le comportement global de l'algorithme révèle des points clés sur la nature des convergences actuelles :
