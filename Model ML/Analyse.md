@@ -1,6 +1,6 @@
 L'examen des premières paires identifiées par l'algorithme montre une cohérence technologique forte. On n'est pas face à du bruit statistique, mais à des trajectoires industrielles tangibles. Voici une analyse objective de ces résultats.
 
-1. Analyse détaillée des paires technologiques
+#### Analyse détaillée des paires technologiques
 F02D / F02P — Moteurs / Allumage
 Optimisation thermique. C'est notre score le plus élevé (0,26). Logique : l'intégration massive de l'électronique est indispensable pour la performance des moteurs hybrides ou à haute efficacité.
 
@@ -28,7 +28,7 @@ Standardisation biologique. Utilisation du génie génétique pour cataloguer et
 G06F / G06N — Info / IA
 硬件 d'accélération. Passage de l'informatique classique à des architectures optimisées pour le calcul neuronal (puces NPU). Un signal constant bien que sélectif.
 
-2. Tendances structurelles et analyse du modèle
+#### Tendances structurelles et analyse du modèle
 Au-delà des paires individuelles, le comportement global de l'algorithme révèle des points clés sur la nature des convergences actuelles :
 
 Domination du type "GPT" (General Purpose Technology) : La majorité des paires sont classées en GPT. Cela reflète la réalité économique : des technologies transversales (IA, Bio, Matériaux) s'infusent dans des domaines applicatifs variés plutôt que de fusionner de manière symétrique.
